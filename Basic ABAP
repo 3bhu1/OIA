@@ -1,0 +1,139 @@
+*&---------------------------------------------------------------------*
+*& Report Z3BHU1_OIA_CLASSICAL
+*&---------------------------------------------------------------------*
+*&
+*&---------------------------------------------------------------------*
+REPORT z3bhu1_oia_classical.
+
+TYPES: BEGIN OF ty_bpa,
+         node_key     TYPE snwd_bpa-node_key,
+         phone_number TYPE snwd_bpa-phone_number,
+         company_name TYPE snwd_bpa-company_name,
+       END OF ty_bpa,
+
+       BEGIN OF ty_head,
+         node_key   TYPE snwd_so_inv_head-node_key,
+         created_at TYPE snwd_so_inv_head-created_at,
+         buyer_id   TYPE snwd_so_inv_head-buyer_guid,
+       END OF ty_head,
+
+       BEGIN OF ty_item,
+         node_key      TYPE snwd_so_inv_item-node_key,
+         parent_key    TYPE snwd_so_inv_item-parent_key,
+         gross_amount  TYPE snwd_so_inv_item-gross_amount,
+         currency_code TYPE snwd_so_inv_item-currency_code,
+       END OF ty_item,
+
+       BEGIN OF ty_final,
+         company_name     TYPE snwd_bpa-company_name,
+         avg_open_days    TYPE i,
+         currency_code    TYPE snwd_so_inv_item-currency_code,
+         sum_gross_amount TYPE snwd_so_inv_item-gross_amount,
+         category         TYPE char1,
+       END OF ty_final.
+DATA: it_bpa          TYPE TABLE OF ty_bpa,
+      wa_bpa          TYPE ty_bpa,
+      it_head         TYPE TABLE OF ty_head,
+      wa_head         TYPE ty_head,
+      it_item         TYPE TABLE OF ty_item,
+      wa_item         TYPE ty_item,
+      it_final        TYPE TABLE OF ty_final,
+      wa_final        TYPE ty_final,
+      it_output       TYPE TABLE OF ty_final,
+      gv_gross_amount TYPE snwd_so_inv_item-gross_amount,
+      mo_timer        TYPE REF TO if_abap_runtime,
+      lv_start        TYPE i,
+      lv_end          TYPE i,
+      lv_runtime      TYPE i,
+      lv_text         TYPE string.
+
+PARAMETERS: p_curr  TYPE snwd_so_inv_item-currency_code.
+
+mo_timer = cl_abap_runtime=>create_hr_timer( ).
+lv_start = mo_timer->get_runtime( ).
+
+PERFORM get_bupa_figures.
+
+lv_end = mo_timer->get_runtime( ).
+lv_runtime = lv_end - lv_start.
+data(lv_runtime_ms) = lv_runtime / 1000000.
+lv_text = lv_runtime_ms.
+CONCATENATE 'Total Execution Time' lv_text 'seconds' INTO lv_text SEPARATED BY space.
+cl_demo_output=>display(
+  EXPORTING
+    data =   it_output  " Text or Data
+    name =   lv_text
+).
+*&---------------------------------------------------------------------*
+*& Form GET_BUPA_FIGURES
+*&---------------------------------------------------------------------*
+*& text
+*&---------------------------------------------------------------------*
+*& -->  p1        text
+*& <--  p2        text
+*&---------------------------------------------------------------------*
+FORM get_bupa_figures .
+  SELECT node_key phone_number company_name
+    FROM snwd_bpa
+  INTO TABLE it_bpa.
+  IF sy-subrc EQ 0 AND it_bpa IS NOT INITIAL.
+    SORT it_bpa BY node_key.
+    SELECT node_key created_at buyer_guid
+      FROM snwd_so_inv_head
+      INTO TABLE it_head
+      FOR ALL ENTRIES IN it_bpa
+      WHERE buyer_guid = it_bpa-node_key
+    AND payment_status = ''.
+    IF sy-subrc EQ 0 AND it_head IS NOT INITIAL.
+      SORT it_head BY node_key.
+      SELECT node_key parent_key gross_amount currency_code
+        FROM snwd_so_inv_item
+        INTO TABLE it_item
+        FOR ALL ENTRIES IN it_head
+        WHERE parent_key = it_head-node_key.
+      IF sy-subrc EQ 0 AND it_item IS NOT INITIAL.
+        SORT it_item BY parent_key.
+        LOOP AT it_item INTO wa_item.
+          IF wa_item-currency_code NE p_curr.
+            CALL FUNCTION 'CONVERT_AMOUNT_TO_CURRENCY'
+              EXPORTING
+*               DATE             = SY-DATUM
+                foreign_currency = wa_item-currency_code
+                foreign_amount   = wa_item-gross_amount
+                local_currency   = p_curr
+              IMPORTING
+                local_amount     = wa_item-gross_amount.
+            IF sy-subrc <> 0.
+* Implement suitable error handling here
+            ENDIF.
+
+          ENDIF.
+          gv_gross_amount = gv_gross_amount + wa_item-gross_amount.
+          AT END OF parent_key.
+            READ TABLE it_head INTO wa_head WITH KEY node_key = wa_item-parent_key BINARY SEARCH.
+            IF sy-subrc EQ 0.
+              READ TABLE it_bpa INTO wa_bpa WITH KEY node_key = wa_head-buyer_id BINARY SEARCH.
+              IF sy-subrc EQ 0.
+                wa_final-company_name = wa_bpa-company_name.
+                wa_final-sum_gross_amount = gv_gross_amount.
+                wa_final-currency_code = p_curr.
+                APPEND wa_final TO it_final.
+                CLEAR gv_gross_amount.
+              ENDIF.
+            ENDIF.
+          ENDAT.
+        ENDLOOP.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+  SORT it_final BY company_name.
+  LOOP AT it_final INTO wa_final.
+    DATA(ls_final) = wa_final.
+    gv_gross_amount = gv_gross_amount + wa_final-sum_gross_amount.
+    AT END OF company_name.
+      ls_final-sum_gross_amount = gv_gross_amount.
+      APPEND ls_final TO it_output.
+      CLEAR gv_gross_amount.
+    ENDAT.
+  ENDLOOP.
+ENDFORM.
