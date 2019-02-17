@@ -8,6 +8,7 @@ REPORT z3bhu1_oia_classical.
 TYPES: BEGIN OF ty_bpa,
          node_key     TYPE snwd_bpa-node_key,
          phone_number TYPE snwd_bpa-phone_number,
+         bp_id        TYPE snwd_bpa-bp_id,
          company_name TYPE snwd_bpa-company_name,
        END OF ty_bpa,
 
@@ -18,7 +19,6 @@ TYPES: BEGIN OF ty_bpa,
        END OF ty_head,
 
        BEGIN OF ty_item,
-         node_key      TYPE snwd_so_inv_item-node_key,
          parent_key    TYPE snwd_so_inv_item-parent_key,
          gross_amount  TYPE snwd_so_inv_item-gross_amount,
          currency_code TYPE snwd_so_inv_item-currency_code,
@@ -26,10 +26,10 @@ TYPES: BEGIN OF ty_bpa,
 
        BEGIN OF ty_final,
          company_name     TYPE snwd_bpa-company_name,
-         avg_open_days    TYPE i,
+         avg_open_days    TYPE p DECIMALS 3,
          currency_code    TYPE snwd_so_inv_item-currency_code,
          sum_gross_amount TYPE snwd_so_inv_item-gross_amount,
-         category         TYPE char1,
+         customer_tagging TYPE char1,
        END OF ty_final.
 DATA: it_bpa          TYPE TABLE OF ty_bpa,
       wa_bpa          TYPE ty_bpa,
@@ -47,7 +47,8 @@ DATA: it_bpa          TYPE TABLE OF ty_bpa,
       lv_runtime      TYPE i,
       lv_text         TYPE string.
 
-PARAMETERS: p_curr  TYPE snwd_so_inv_item-currency_code.
+PARAMETERS: p_curr  TYPE snwd_so_inv_item-currency_code OBLIGATORY,
+            p_check AS CHECKBOX.
 
 mo_timer = cl_abap_runtime=>create_hr_timer( ).
 lv_start = mo_timer->get_runtime( ).
@@ -56,7 +57,7 @@ PERFORM get_bupa_figures.
 
 lv_end = mo_timer->get_runtime( ).
 lv_runtime = lv_end - lv_start.
-data(lv_runtime_ms) = lv_runtime / 1000000.
+DATA(lv_runtime_ms) = lv_runtime / 1000000.
 lv_text = lv_runtime_ms.
 CONCATENATE 'Total Execution Time' lv_text 'seconds' INTO lv_text SEPARATED BY space.
 cl_demo_output=>display(
@@ -73,7 +74,20 @@ cl_demo_output=>display(
 *& <--  p2        text
 *&---------------------------------------------------------------------*
 FORM get_bupa_figures .
-  SELECT node_key phone_number company_name
+  TYPES: BEGIN OF ty_open_days_sum,
+           bp_id           TYPE snwd_bpa-bp_id,
+           total_open_days TYPE i,
+           so_count_sum    TYPE i,
+         END OF ty_open_days_sum.
+  DATA: lv_string        TYPE char25,
+        lv_open_days     TYPE i,
+        lv_cnt           TYPE i,
+        lv_created_at    TYPE dats,
+        lt_open_days_sum TYPE SORTED TABLE OF ty_open_days_sum WITH UNIQUE KEY bp_id,
+        ls_open_days_sum TYPE ty_open_days_sum,
+        lv_ts_now        TYPE timestampl.
+  GET TIME STAMP FIELD lv_ts_now.
+  SELECT node_key phone_number bp_id company_name
     FROM snwd_bpa
   INTO TABLE it_bpa.
   IF sy-subrc EQ 0 AND it_bpa IS NOT INITIAL.
@@ -86,12 +100,24 @@ FORM get_bupa_figures .
     AND payment_status = ''.
     IF sy-subrc EQ 0 AND it_head IS NOT INITIAL.
       SORT it_head BY node_key.
-      SELECT node_key parent_key gross_amount currency_code
+      SELECT parent_key gross_amount currency_code
         FROM snwd_so_inv_item
         INTO TABLE it_item
         FOR ALL ENTRIES IN it_head
         WHERE parent_key = it_head-node_key.
       IF sy-subrc EQ 0 AND it_item IS NOT INITIAL.
+        LOOP AT it_head INTO wa_head.
+          READ TABLE it_bpa INTO wa_bpa WITH KEY node_key = wa_head-buyer_id BINARY SEARCH.
+          IF sy-subrc EQ 0.
+            ls_open_days_sum-bp_id = wa_bpa-bp_id.
+            ls_open_days_sum-so_count_sum = 1.
+            DATA(lv_now_secs) = cl_oia_provider_util=>convert_timestampl_2_secs( lv_ts_now ).
+            ls_open_days_sum-total_open_days = round( val = ( lv_now_secs - cl_oia_provider_util=>convert_timestampl_2_secs( wa_head-created_at ) ) / 86400
+                                  dec = 0
+                                 mode = cl_abap_math=>round_floor ).
+            COLLECT ls_open_days_sum INTO lt_open_days_sum.
+          ENDIF.
+        ENDLOOP.
         SORT it_item BY parent_key.
         LOOP AT it_item INTO wa_item.
           IF wa_item-currency_code NE p_curr.
@@ -115,25 +141,39 @@ FORM get_bupa_figures .
               READ TABLE it_bpa INTO wa_bpa WITH KEY node_key = wa_head-buyer_id BINARY SEARCH.
               IF sy-subrc EQ 0.
                 wa_final-company_name = wa_bpa-company_name.
-                wa_final-sum_gross_amount = gv_gross_amount.
                 wa_final-currency_code = p_curr.
+                wa_final-sum_gross_amount = gv_gross_amount.
+                READ TABLE lt_open_days_sum INTO ls_open_days_sum WITH KEY bp_id = wa_bpa-bp_id BINARY SEARCH.
+                IF sy-subrc EQ 0.
+                  wa_final-avg_open_days = ls_open_days_sum-total_open_days / ls_open_days_sum-so_count_sum.
+                ENDIF.
                 APPEND wa_final TO it_final.
-                CLEAR gv_gross_amount.
+                CLEAR: wa_head,wa_bpa,wa_final,gv_gross_amount.
               ENDIF.
             ENDIF.
+          ENDAT.
+        ENDLOOP.
+        SORT it_final BY company_name.
+        LOOP AT it_final INTO wa_final.
+          DATA(ls_final) = wa_final.
+          gv_gross_amount = gv_gross_amount + wa_final-sum_gross_amount.
+          AT END OF company_name.
+            ls_final-sum_gross_amount = gv_gross_amount.
+            ls_final-customer_tagging = boolc( ( ls_final-avg_open_days > 30 )
+                                            AND
+                                            ( ls_final-sum_gross_amount > 10000000 ) ).
+            ls_final-avg_open_days = ls_final-avg_open_days / 1000.
+            IF p_check EQ 'X'.
+                IF ls_final-customer_tagging EQ 'X'.
+                    APPEND ls_final TO it_output.
+                ENDIF.
+            ELSE.
+                APPEND ls_final TO it_output.
+            ENDIF.
+            CLEAR gv_gross_amount.
           ENDAT.
         ENDLOOP.
       ENDIF.
     ENDIF.
   ENDIF.
-  SORT it_final BY company_name.
-  LOOP AT it_final INTO wa_final.
-    DATA(ls_final) = wa_final.
-    gv_gross_amount = gv_gross_amount + wa_final-sum_gross_amount.
-    AT END OF company_name.
-      ls_final-sum_gross_amount = gv_gross_amount.
-      APPEND ls_final TO it_output.
-      CLEAR gv_gross_amount.
-    ENDAT.
-  ENDLOOP.
 ENDFORM.
