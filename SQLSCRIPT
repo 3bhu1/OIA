@@ -1,0 +1,75 @@
+drop procedure get_bupa_figures;
+create procedure get_bupa_figures (in p_curr nvarchar(4), in p_check nvarchar(1), out outtab ty_final)
+language sqlscript
+sql security invoker
+default schema "SAPABAP1"
+reads sql data
+as begin
+
+	declare lv_max_days integer;
+	declare lv_max_amount decimal(15,2);
+	declare lv_date date;
+	declare lv_client varchar(3);
+	declare lv_curr_timestamp timestamp;
+	
+	lv_max_days = 30;
+	lv_max_amount = 10000000.00;
+	lv_client = 400;
+	select current_date into lv_date from dummy;
+	select to_timestamp(localtoutc(now(),'CET')) into lv_curr_timestamp from dummy;
+	
+	lt_sum_gross_amounts = select hdr.buyer_guid as buyer_guid, sum(item.gross_amount) as gross_amount, 
+						  item.currency_code as currency_code 
+						  from snwd_so_inv_head as hdr
+						  inner join snwd_so_inv_item as item 
+						  on hdr.node_key = item.parent_key
+						  where hdr.payment_status = '' and hdr.client = :lv_client
+						  group by hdr.buyer_guid, item.currency_code;
+	
+	lt_amount_all_curr = select bpa.company_name as company_name, bpa.bp_id as bp_id, 
+						 ltitem.gross_amount as gross_amount, 
+						 ltitem.currency_code as currency_code
+						 from snwd_bpa as bpa
+						 inner join :lt_sum_gross_amounts as ltitem
+						 on bpa.node_key = ltitem.buyer_guid;
+						 
+	lt_amount_conv = CE_CONVERSION(:lt_amount_all_curr,[
+		family = 'currency', method = 'ERP', steps = 'shift,convert,shift_back',
+		client = :lv_client,
+		source_unit_column = "CURRENCY_CODE", target_unit = :p_curr,
+		reference_date = :lv_date, output_unit_column = "CONVERTED_CURR"
+	],[gross_amount]);
+
+	lt_total_amount_conv = select company_name as company_name, 
+	                  sum(gross_amount) as gross_amount, 
+	                 "CONVERTED_CURR" as currency_code
+					 from :lt_amount_conv group by company_name, converted_curr;
+					 
+	lt_total_days_per_invoice = select buyer_guid as buyer_guid, 
+					days_between(to_timestamp(left(created_at,14),'YYYYMMDDHHMISS'),:lv_curr_timestamp) 
+					as total_inv_open_days
+					from snwd_so_inv_head where payment_status = '';
+					
+	lt_avg_open_days = select bpa.company_name as company_name,
+					   sum(lttdpi.total_inv_open_days)/count(lttdpi.total_inv_open_days) as avg_open_days
+					   from snwd_bpa as bpa inner join :lt_total_days_per_invoice as lttdpi
+					   on bpa.node_key = lttdpi.buyer_guid
+					   group by bpa.company_name;
+			 
+	lt_outtab = select lttac.company_name, round(ltaod.avg_open_days/1000,3) as avg_open_days, 
+			 lttac.currency_code as currency_code, lttac.gross_amount as sum_gross_amount, 
+			 case when ltaod.avg_open_days > lv_max_days and lttac.gross_amount > lv_max_amount
+			 then 'X'
+			 else ''
+			 end as customer_tagging
+			 from :lt_total_amount_conv as lttac inner join :lt_avg_open_days as ltaod
+			 on lttac.company_name = ltaod.company_name
+			 order by company_name;
+			 
+	if :p_check = 'X' then
+		outtab = select * from :lt_outtab where customer_tagging = 'X';
+	else 
+		outtab = select * from :lt_outtab;
+	end if;
+					 
+end;
