@@ -1,0 +1,114 @@
+*&---------------------------------------------------------------------*
+*& Report Z3BHU1_OIA_SQLSCRIPT
+*&---------------------------------------------------------------------*
+*&
+*&---------------------------------------------------------------------*
+REPORT z3bhu1_oia_sqlscript.
+
+TYPES: BEGIN OF ty_bpa,
+         node_key     TYPE snwd_bpa-node_key,
+         phone_number TYPE snwd_bpa-phone_number,
+         bp_id        TYPE snwd_bpa-bp_id,
+         company_name TYPE snwd_bpa-company_name,
+       END OF ty_bpa,
+
+       BEGIN OF ty_head,
+         node_key   TYPE snwd_so_inv_head-node_key,
+         created_at TYPE snwd_so_inv_head-created_at,
+         buyer_id   TYPE snwd_so_inv_head-buyer_guid,
+       END OF ty_head,
+
+       BEGIN OF ty_item,
+         parent_key    TYPE snwd_so_inv_item-parent_key,
+         gross_amount  TYPE snwd_so_inv_item-gross_amount,
+         currency_code TYPE snwd_so_inv_item-currency_code,
+       END OF ty_item,
+
+       BEGIN OF ty_final,
+         company_name     TYPE snwd_bpa-company_name,
+         avg_open_days    TYPE p DECIMALS 3,
+         currency_code    TYPE snwd_so_inv_item-currency_code,
+         sum_gross_amount TYPE snwd_so_inv_item-gross_amount,
+         customer_tagging TYPE char1,
+       END OF ty_final.
+DATA: it_bpa          TYPE TABLE OF ty_bpa,
+      wa_bpa          TYPE ty_bpa,
+      it_head         TYPE TABLE OF ty_head,
+      wa_head         TYPE ty_head,
+      it_item         TYPE TABLE OF ty_item,
+      wa_item         TYPE ty_item,
+      it_final        TYPE TABLE OF ty_final,
+      wa_final        TYPE ty_final,
+      it_output       TYPE TABLE OF ty_final,
+      gv_gross_amount TYPE snwd_so_inv_item-gross_amount,
+      mo_timer        TYPE REF TO if_abap_runtime,
+      lv_start        TYPE i,
+      lv_end          TYPE i,
+      lv_runtime      TYPE i,
+      lv_text         TYPE string.
+
+PARAMETERS: p_curr  TYPE snwd_so_inv_item-currency_code OBLIGATORY,
+            p_check AS CHECKBOX.
+
+mo_timer = cl_abap_runtime=>create_hr_timer( ).
+lv_start = mo_timer->get_runtime( ).
+
+PERFORM get_bupa_figures.
+
+lv_end = mo_timer->get_runtime( ).
+lv_runtime = lv_end - lv_start.
+DATA(lv_runtime_ms) = lv_runtime / 1000000.
+lv_text = lv_runtime_ms.
+CONCATENATE 'Total Execution Time' lv_text 'seconds' INTO lv_text SEPARATED BY space.
+cl_demo_output=>display(
+  EXPORTING
+    data =   it_output  " Text or Data
+    name =   lv_text
+).
+*&---------------------------------------------------------------------*
+*& Form GET_BUPA_FIGURES
+*&---------------------------------------------------------------------*
+*& text
+*&---------------------------------------------------------------------*
+*& -->  p1        text
+*& <--  p2        text
+*&---------------------------------------------------------------------*
+FORM get_bupa_figures .
+  TYPES: BEGIN OF ty_overview,
+           variable type string,
+           table type  string,
+         END OF ty_overview.
+  DATA: dynamic_data TYPE REF TO data,
+        lt_overview TYPE TABLE OF ty_overview,
+        ls_overview TYPE ty_overview.
+"ADBC to call db procedure
+ Data(lv_query) = | call get_bupa_figures( '{ p_curr }' , '{ p_check }', NULL ) with overview |.
+ "Assign Target Variable
+ GET REFERENCE OF lt_overview INTO dynamic_data.
+ TRY.
+   data(lo_connection) = cl_sql_connection=>get_connection( ).
+   data(lo_statement) = lo_connection->create_statement( ).
+   data(lo_result) = lo_statement->execute_query( lv_query ).
+   lo_result->set_param_table( dynamic_data ).
+   "Read Result into internal table
+   lo_result->next_package( ).
+   "Close connection
+   lo_result->close( ).
+   CLEAR dynamic_data.
+   "build SQL statement using the table from HANA DB and fetch data
+   READ TABLE lt_overview INTO ls_overview with key variable = 'OUTTAB'.
+   data(lv_sql) = | select * from { ls_overview-table } |.
+   "exceute query
+   lo_result = lo_statement->execute_query( lv_sql ).
+   "Assign target variable
+   GET REFERENCE OF it_output INTO dynamic_data.
+   lo_result->set_param_table( dynamic_data ).
+   "Read Result into internal table
+   lo_result->next_package( ).
+   "Close connection
+   lo_result->close( ).
+*Exception Handling
+   CATCH cx_sql_exception INTO data(lx_sql_exc).
+     MESSAGE lx_sql_exc TYPE 'I' DISPLAY LIKE 'E'.
+ ENDTRY.
+ENDFORM.
